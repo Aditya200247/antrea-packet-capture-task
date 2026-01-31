@@ -43,7 +43,7 @@ func (cm *CaptureManager) SyncCapture(pod *corev1.Pod) error {
 
 	// 1. Start if annotation present and not running
 	if hasAnnotation && !isRunning {
-		slog.Info("Starting capture", "pod", pod.Name, "limit", val)
+		slog.Info("Starting capture", "pod", key, "limit", val)
 		ctx, cancel := context.WithCancel(context.Background())
 		cm.captures[key] = cancel
 		go cm.runTcpdump(ctx, pod, val, key)
@@ -51,14 +51,14 @@ func (cm *CaptureManager) SyncCapture(pod *corev1.Pod) error {
 
 	// 2. Stop if annotation removed and is running
 	if !hasAnnotation && isRunning {
-		slog.Info("Stopping capture (annotation removed)", "pod", pod.Name)
-		cm.stop(key, pod.Name)
+		slog.Info("Stopping capture (annotation removed)", "pod", key)
+		cm.stop(key, pod.Namespace, pod.Name)
 	}
 
 	// 3. Stop if Pod is deleting
 	if pod.DeletionTimestamp != nil && isRunning {
-		slog.Info("Stopping capture (pod terminating)", "pod", pod.Name)
-		cm.stop(key, pod.Name)
+		slog.Info("Stopping capture (pod terminating)", "pod", key)
+		cm.stop(key, pod.Namespace, pod.Name)
 	}
 
 	return nil
@@ -67,26 +67,32 @@ func (cm *CaptureManager) SyncCapture(pod *corev1.Pod) error {
 func (cm *CaptureManager) StopCaptureByKey(key string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	// Extract pod name from key for file cleanup (namespace/name)
+
+	// Parse the key "namespace/name" to generate the filename for cleanup
 	parts := strings.Split(key, "/")
-	podName := key
-	if len(parts) > 1 {
-		podName = parts[1]
+	if len(parts) != 2 {
+		slog.Error("Invalid key format in StopCaptureByKey", "key", key)
+		return
 	}
-	cm.stop(key, podName)
+	namespace := parts[0]
+	name := parts[1]
+
+	cm.stop(key, namespace, name)
 }
 
-func (cm *CaptureManager) stop(key string, podName string) {
+// Internal stop helper - assumes lock is held
+func (cm *CaptureManager) stop(key, namespace, podName string) {
 	if cancel, ok := cm.captures[key]; ok {
 		cancel()
 		delete(cm.captures, key)
-		cm.cleanupFiles(podName)
+		cm.cleanupFiles(namespace, podName)
 	}
 }
 
-func (cm *CaptureManager) cleanupFiles(podName string) {
-	// Pattern: capture-<PodName>.pcap*
-	pattern := filepath.Join(CaptureDir, fmt.Sprintf("capture-%s.pcap*", podName))
+func (cm *CaptureManager) cleanupFiles(namespace, podName string) {
+	// FIX: Include Namespace in filename to avoid collisions
+	// Pattern: capture-<Namespace>-<PodName>.pcap*
+	pattern := filepath.Join(CaptureDir, fmt.Sprintf("capture-%s-%s.pcap*", namespace, podName))
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		slog.Error("Failed to glob cleanup files", "err", err)
@@ -110,12 +116,15 @@ func (cm *CaptureManager) runTcpdump(ctx context.Context, pod *corev1.Pod, limit
 		cm.mu.Unlock()
 		return
 	}
-	// Use the first container for simplicity, or find the main one
+
 	containerID := pod.Status.ContainerStatuses[0].ContainerID
-	// Format: containerd://<id>
+	// Format: containerd://<id> or cri-o://<id>
 	parts := strings.Split(containerID, "://")
 	if len(parts) < 2 {
 		slog.Error("Invalid container ID format", "id", containerID)
+		cm.mu.Lock()
+		delete(cm.captures, key)
+		cm.mu.Unlock()
 		return
 	}
 	cid := parts[1]
@@ -124,8 +133,6 @@ func (cm *CaptureManager) runTcpdump(ctx context.Context, pod *corev1.Pod, limit
 	pid, err := findPidByContainerID(cid)
 	if err != nil {
 		slog.Error("Failed to find PID for container", "id", cid, "err", err)
-		// Don't retry immediately in this simple loop, just exit.
-		// logic could be improved to retry.
 		cm.mu.Lock()
 		delete(cm.captures, key)
 		cm.mu.Unlock()
@@ -133,44 +140,34 @@ func (cm *CaptureManager) runTcpdump(ctx context.Context, pod *corev1.Pod, limit
 	}
 
 	// 3. Build Command
-	// tcpdump -C 1M -W <N> -w /var/log/antrea-captures/capture-<PodName>.pcap
-	pcapFile := filepath.Join(CaptureDir, fmt.Sprintf("capture-%s.pcap", pod.Name))
+	// FIX: Include Namespace in filename
+	pcapFile := filepath.Join(CaptureDir, fmt.Sprintf("capture-%s-%s.pcap", pod.Namespace, pod.Name))
 
-	// args: -t <PID> -n -- tcpdump ...
 	args := []string{
 		"-t", fmt.Sprintf("%d", pid),
-		"-n", // Check network namespace
+		"-n",
 		"--",
 		"tcpdump",
-		"-Z", "root", // Run as root to ensure write permissions
+		"-Z", "root",
 		"-i", "any",
-		"-C", "1", // 1MB
-		"-W", limit, // Rotate N files
+		"-C", "1",
+		"-W", limit,
 		"-w", pcapFile,
 	}
 
 	slog.Info("Executing nsenter", "args", args)
 	cmd := exec.CommandContext(ctx, "nsenter", args...)
-
-	// Capture stderr for debug
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		// If Context canceled, it's expected
 		if ctx.Err() == context.Canceled {
 			slog.Info("Capture stopped gracefully", "pod", pod.Name)
 		} else {
 			slog.Error("Tcpdump exited with error", "err", err)
 		}
 	}
-
-	// Cleanup happens in Stop() usually, but if process dies on its own, ensure map is cleared?
-	// The sync loop will handle state reconciliation, but strictly we should ensure map consistency.
-	// For this task, strict map consistency on self-termination is nice to have.
 }
 
-// findPidByContainerID scans /proc to find the PID associated with the container ID (in cgroup).
-// This requires hostPID: true and generated code access to /proc.
 func findPidByContainerID(containerID string) (int, error) {
 	dirs, err := os.ReadDir("/proc")
 	if err != nil {
@@ -181,7 +178,6 @@ func findPidByContainerID(containerID string) (int, error) {
 		if !d.IsDir() {
 			continue
 		}
-		// Check if name is numeric
 		if _, err := fmt.Sscanf(d.Name(), "%d", new(int)); err != nil {
 			continue
 		}
@@ -192,7 +188,6 @@ func findPidByContainerID(containerID string) (int, error) {
 			continue
 		}
 
-		// Search for containerID in cgroup file
 		scanner := bufio.NewScanner(f)
 		found := false
 		for scanner.Scan() {
