@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -43,10 +44,16 @@ func (cm *CaptureManager) SyncCapture(pod *corev1.Pod) error {
 
 	// 1. Start if annotation present and not running
 	if hasAnnotation && !isRunning {
-		slog.Info("Starting capture", "pod", key, "limit", val)
+		// Validate limit. Default to "10" if empty or not a number.
+		limit := val
+		if _, err := strconv.Atoi(limit); err != nil {
+			limit = "10" // Default safe value
+		}
+
+		slog.Info("Starting capture", "pod", key, "limit", limit)
 		ctx, cancel := context.WithCancel(context.Background())
 		cm.captures[key] = cancel
-		go cm.runTcpdump(ctx, pod, val, key)
+		go cm.runTcpdump(ctx, pod, limit, key)
 	}
 
 	// 2. Stop if annotation removed and is running
