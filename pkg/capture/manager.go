@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -22,7 +21,7 @@ const (
 
 type CaptureManager struct {
 	mu       sync.Mutex
-	captures map[types.UID]context.CancelFunc
+	captures map[string]context.CancelFunc // Key: namespace/name
 }
 
 func NewCaptureManager() *CaptureManager {
@@ -30,7 +29,7 @@ func NewCaptureManager() *CaptureManager {
 		slog.Error("Failed to create capture directory", "err", err)
 	}
 	return &CaptureManager{
-		captures: make(map[types.UID]context.CancelFunc),
+		captures: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -38,37 +37,49 @@ func (cm *CaptureManager) SyncCapture(pod *corev1.Pod) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	uid := pod.UID
+	key := pod.Namespace + "/" + pod.Name
 	val, hasAnnotation := pod.Annotations[AnnotationKey]
-	_, isRunning := cm.captures[uid]
+	_, isRunning := cm.captures[key]
 
 	// 1. Start if annotation present and not running
 	if hasAnnotation && !isRunning {
 		slog.Info("Starting capture", "pod", pod.Name, "limit", val)
 		ctx, cancel := context.WithCancel(context.Background())
-		cm.captures[uid] = cancel
-		go cm.runTcpdump(ctx, pod, val)
+		cm.captures[key] = cancel
+		go cm.runTcpdump(ctx, pod, val, key)
 	}
 
 	// 2. Stop if annotation removed and is running
 	if !hasAnnotation && isRunning {
 		slog.Info("Stopping capture (annotation removed)", "pod", pod.Name)
-		cm.stop(uid, pod.Name)
+		cm.stop(key, pod.Name)
 	}
 
 	// 3. Stop if Pod is deleting
 	if pod.DeletionTimestamp != nil && isRunning {
 		slog.Info("Stopping capture (pod terminating)", "pod", pod.Name)
-		cm.stop(uid, pod.Name)
+		cm.stop(key, pod.Name)
 	}
 
 	return nil
 }
 
-func (cm *CaptureManager) stop(uid types.UID, podName string) {
-	if cancel, ok := cm.captures[uid]; ok {
+func (cm *CaptureManager) StopCaptureByKey(key string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	// Extract pod name from key for file cleanup (namespace/name)
+	parts := strings.Split(key, "/")
+	podName := key
+	if len(parts) > 1 {
+		podName = parts[1]
+	}
+	cm.stop(key, podName)
+}
+
+func (cm *CaptureManager) stop(key string, podName string) {
+	if cancel, ok := cm.captures[key]; ok {
 		cancel()
-		delete(cm.captures, uid)
+		delete(cm.captures, key)
 		cm.cleanupFiles(podName)
 	}
 }
@@ -90,12 +101,12 @@ func (cm *CaptureManager) cleanupFiles(podName string) {
 	}
 }
 
-func (cm *CaptureManager) runTcpdump(ctx context.Context, pod *corev1.Pod, limit string) {
+func (cm *CaptureManager) runTcpdump(ctx context.Context, pod *corev1.Pod, limit string, key string) {
 	// 1. Get ContainerID
 	if len(pod.Status.ContainerStatuses) == 0 {
 		slog.Error("No container statuses found", "pod", pod.Name)
 		cm.mu.Lock()
-		delete(cm.captures, pod.UID)
+		delete(cm.captures, key)
 		cm.mu.Unlock()
 		return
 	}
@@ -116,7 +127,7 @@ func (cm *CaptureManager) runTcpdump(ctx context.Context, pod *corev1.Pod, limit
 		// Don't retry immediately in this simple loop, just exit.
 		// logic could be improved to retry.
 		cm.mu.Lock()
-		delete(cm.captures, pod.UID)
+		delete(cm.captures, key)
 		cm.mu.Unlock()
 		return
 	}

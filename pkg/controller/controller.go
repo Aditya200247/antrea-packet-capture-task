@@ -72,29 +72,24 @@ func (c *Controller) syncHandler(key string) error {
 	}
 
 	if !exists {
-		// If Pod is deleted, we might need to cleanup.
-		// However, our CaptureManager handles cleanup if it tracked the pod by UID.
-		// BUT the Manager only knows about Active captures by UID.
-		// If the pod is gone from the API server, we can't get its UID easily from just the key (namespace/name).
-		// Wait, 'key' is not UID.
-		// If exists is false, we can't call manager.SyncCapture(pod).
-		// But in a real scenario, Deletion is handled by DeleteFunc which has the 'obj' (last known state).
-		// We can add a fallback cleanup if needed, but Manager tracks by UID.
-		// Strictly, if Pod is deleted, key comes here. But we don't have the UID unless we cache it.
-		// Simplification: relying on DeleteFunc adding to queue? No, queue only has string key.
-		// K8s pattern: When 'exists' is false, it means deleted.
-		// Our Manager cleans up when it sees DeletionTimestamp or internal map vs reality.
-		// Issue: If we don't pass the Pod, Manager doesn't know WHO to stop.
-		// Solution: The CaptureManager should probably be robust or we track mapping in Controller.
-		// Let's assume DeleteFunc + UpdateFunc ensures Manager sees the deletion state *before* it vanishes,
-		// OR we accept that restarting the DaemonSet kills orphans (simpler).
-		// For this task, handling Update with DeletionTimestamp is usually enough.
-		// The deletion event might arrive after the object is gone.
-		// We'll rely on the fact that before full deletion, we get an update with DeletionTimestamp.
+		// Pod is gone. We must ensure any running capture for this key is stopped.
+		c.manager.StopCaptureByKey(key)
 		return nil
 	}
 
-	pod := obj.(*corev1.Pod)
+	// Handle "DeletedFinalStateUnknown" which happens if we missed the delete event
+	if unknown, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		// We only care about the key to stop the capture
+		c.manager.StopCaptureByKey(unknown.Key)
+		return nil
+	}
+
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		slog.Error("Object is not a Pod", "key", key)
+		return nil
+	}
+
 	return c.manager.SyncCapture(pod)
 }
 
