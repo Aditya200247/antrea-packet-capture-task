@@ -14,8 +14,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -o manager cmd/manager/main.go
 # Stage 2: Runtime
 FROM ubuntu:24.04
 
-# Install tcpdump
-RUN apt-get update && apt-get install -y tcpdump && rm -rf /var/lib/apt/lists/*
+# Install tcpdump and util-linux (for nsenter)
+RUN apt-get update && apt-get install -y tcpdump util-linux && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /
 COPY --from=builder /workspace/manager .
