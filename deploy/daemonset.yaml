@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: capture-controller
+  namespace: default
+  labels:
+    app: capture-controller
+spec:
+  selector:
+    matchLabels:
+      app: capture-controller
+  template:
+    metadata:
+      labels:
+        app: capture-controller
+    spec:
+      serviceAccountName: capture-controller-sa
+      hostPID: true
+      containers:
+      - name: controller
+        image: antrea-lfx-controller:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        resources:
+          limits:
+            cpu: 200m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
