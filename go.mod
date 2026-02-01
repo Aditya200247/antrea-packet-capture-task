@@ -1,6 +1,6 @@
 module github.com/user/antrea-lfx-task
 
-go 1.25.6
+go 1.23.0
 
 require (
 	k8s.io/api v0.29.0
